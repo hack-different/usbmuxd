@@ -53,7 +53,7 @@
 #define NUM_RX_LOOPS 3
 
 struct usb_device {
-	libusb_device_handle *dev;
+	libusb_device_handle *handle;
 	uint8_t bus, address;
 	char serial[256];
 	int alive;
@@ -63,6 +63,14 @@ struct usb_device {
 	int wMaxPacketSize;
 	uint64_t speed;
 	struct libusb_device_descriptor devdesc;
+};
+
+struct mode_context {
+	struct libusb_device* dev;
+	uint8_t bus, address;
+	uint8_t bRequest;
+	uint16_t wValue, wIndex, wLength;
+	unsigned int timeout;
 };
 
 static struct collection device_list;
@@ -75,7 +83,7 @@ static int device_hotplug = 1;
 
 static void usb_disconnect(struct usb_device *dev)
 {
-	if(!dev->dev) {
+	if(!dev->handle) {
 		return;
 	}
 
@@ -106,9 +114,9 @@ static void usb_disconnect(struct usb_device *dev)
 
 	collection_free(&dev->tx_xfers);
 	collection_free(&dev->rx_xfers);
-	libusb_release_interface(dev->dev, dev->interface);
-	libusb_close(dev->dev);
-	dev->dev = NULL;
+	libusb_release_interface(dev->handle, dev->interface);
+	libusb_close(dev->handle);
+	dev->handle = NULL;
 	collection_remove(&device_list, dev);
 	free(dev);
 }
@@ -169,7 +177,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 {
 	int res;
 	struct libusb_transfer *xfer = libusb_alloc_transfer(0);
-	libusb_fill_bulk_transfer(xfer, dev->dev, dev->ep_out, (void*)buf, length, tx_callback, dev, 0);
+	libusb_fill_bulk_transfer(xfer, dev->handle, dev->ep_out, (void*)buf, length, tx_callback, dev, 0);
 	if((res = libusb_submit_transfer(xfer)) < 0) {
 		usbmuxd_log(LL_ERROR, "Failed to submit TX transfer %p len %d to device %d-%d: %s", buf, length, dev->bus, dev->address, libusb_error_name(res));
 		libusb_free_transfer(xfer);
@@ -181,7 +189,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 		// Send Zero Length Packet
 		xfer = libusb_alloc_transfer(0);
 		void *buffer = malloc(1);
-		libusb_fill_bulk_transfer(xfer, dev->dev, dev->ep_out, buffer, 0, tx_callback, dev, 0);
+		libusb_fill_bulk_transfer(xfer, dev->handle, dev->ep_out, buffer, 0, tx_callback, dev, 0);
 		if((res = libusb_submit_transfer(xfer)) < 0) {
 			usbmuxd_log(LL_ERROR, "Failed to submit TX ZLP transfer to device %d-%d: %s", dev->bus, dev->address, libusb_error_name(res));
 			libusb_free_transfer(xfer);
@@ -248,7 +256,7 @@ static int start_rx_loop(struct usb_device *dev)
 	void *buf;
 	struct libusb_transfer *xfer = libusb_alloc_transfer(0);
 	buf = malloc(USB_MRU);
-	libusb_fill_bulk_transfer(xfer, dev->dev, dev->ep_in, buf, USB_MRU, rx_callback, dev, 0);
+	libusb_fill_bulk_transfer(xfer, dev->handle, dev->ep_in, buf, USB_MRU, rx_callback, dev, 0);
 	if((res = libusb_submit_transfer(xfer)) != 0) {
 		usbmuxd_log(LL_ERROR, "Failed to submit RX transfer to device %d-%d: %s", dev->bus, dev->address, libusb_error_name(res));
 		libusb_free_transfer(xfer);
@@ -349,7 +357,7 @@ static void get_langid_callback(struct libusb_transfer *transfer)
 	libusb_fill_control_setup(transfer->buffer, LIBUSB_ENDPOINT_IN, LIBUSB_REQUEST_GET_DESCRIPTOR,
 			(uint16_t)((LIBUSB_DT_STRING << 8) | usbdev->devdesc.iSerialNumber),
 			langid, 1024 + LIBUSB_CONTROL_SETUP_SIZE);
-	libusb_fill_control_transfer(transfer, usbdev->dev, transfer->buffer, get_serial_callback, usbdev, 1000);
+	libusb_fill_control_transfer(transfer, usbdev->handle, transfer->buffer, get_serial_callback, usbdev, 1000);
 
 	if((res = libusb_submit_transfer(transfer)) < 0) {
 		usbmuxd_log(LL_ERROR, "Could not request transfer for device %d-%d: %s", usbdev->bus, usbdev->address, libusb_error_name(res));
@@ -357,183 +365,238 @@ static void get_langid_callback(struct libusb_transfer *transfer)
 	}
 }
 
-static int usb_device_add(libusb_device* dev)
+static int submit_vendor_specific(struct libusb_device_handle *handle, struct mode_context *context, libusb_transfer_cb_fn callback) 
 {
-	int j, res;
-	// the following are non-blocking operations on the device list
-	uint8_t bus = libusb_get_bus_number(dev);
-	uint8_t address = libusb_get_device_address(dev);
-	struct libusb_device_descriptor devdesc;
-	struct libusb_transfer *transfer;
-	int found = 0;
+	struct libusb_transfer* ctrl_transfer = libusb_alloc_transfer(0);
+	int ret = 0; 
+	unsigned char* buffer = calloc(LIBUSB_CONTROL_SETUP_SIZE + context->wLength, 1);
+	uint8_t bRequestType = LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN | LIBUSB_RECIPIENT_DEVICE;
+	libusb_fill_control_setup(buffer, bRequestType, context->bRequest, context->wValue, context->wIndex, context->wLength);
+	
+	ctrl_transfer->flags = LIBUSB_TRANSFER_FREE_TRANSFER;
+	libusb_fill_control_transfer(ctrl_transfer, handle, buffer, callback, context, context->timeout);
+	
+	ret = libusb_submit_transfer(ctrl_transfer);
+	return ret;
+}
+
+static struct usb_device* find_device(int bus, int address)
+{
 	FOREACH(struct usb_device *usbdev, &device_list) {
 		if(usbdev->bus == bus && usbdev->address == address) {
-			usbdev->alive = 1;
-			found = 1;
-			break;
+			return usbdev;
 		}
 	} ENDFOREACH
-	if(found)
-		return 0; //device already found
+	return NULL;
+}
 
-	if((res = libusb_get_device_descriptor(dev, &devdesc)) != 0) {
-		usbmuxd_log(LL_WARNING, "Could not get device descriptor for device %d-%d: %s", bus, address, libusb_error_name(res));
-		return -1;
-	}
-	if(devdesc.idVendor != VID_APPLE)
-		return -1;
-	if((devdesc.idProduct != PID_APPLE_T2_COPROCESSOR) &&
-	   ((devdesc.idProduct < PID_APPLE_SILICON_RESTORE_LOW) ||
-		(devdesc.idProduct > PID_APPLE_SILICON_RESTORE_MAX)) &&
-	   ((devdesc.idProduct < PID_RANGE_LOW) ||
-		(devdesc.idProduct > PID_RANGE_MAX)))
-		return -1;
-	libusb_device_handle *handle;
-	usbmuxd_log(LL_INFO, "Found new device with v/p %04x:%04x at %d-%d", devdesc.idVendor, devdesc.idProduct, bus, address);
-	// No blocking operation can follow: it may be run in the libusb hotplug callback and libusb will refuse any
-	// blocking call
-	if((res = libusb_open(dev, &handle)) != 0) {
-		usbmuxd_log(LL_WARNING, "Could not open device %d-%d: %s", bus, address, libusb_error_name(res));
-		return -1;
+/// @brief guess the current mode
+/// @param dev 
+/// @param usbdev 
+/// @param handle 
+/// @return 0 - undetermined, 1 - initial, 2 - valeria, 3 - cdc_ncm, 4 - usbeth+cdc_ncm, 5 - cdc_ncm direct
+static int guess_mode(struct libusb_device* dev, struct usb_device *usbdev)
+{
+	int res, j;
+	int has_valeria = 0, has_cdc_ncm = 0, has_usbmux = 0;
+	struct libusb_device_descriptor devdesc = usbdev->devdesc;
+	struct libusb_config_descriptor *config;
+	int bus = usbdev->bus;
+	int address = usbdev->address;
+
+	if(devdesc.bNumConfigurations == 1) {
+		// CDC-NCM Direct
+		return 5;
 	}
 
-	int desired_config = devdesc.bNumConfigurations;
-	if (desired_config > 4) {
-		if (desired_config > 5) {
-			usbmuxd_log(LL_ERROR, "Device %d-%d has more than 5 configurations, but usbmuxd doesn't support that. Choosing configuration 5 instead.", bus, address);
-			desired_config = 5;
+	if(devdesc.bNumConfigurations <= 4) {
+		// Assume this is initial mode
+		return 1;
+	}
+
+	if(devdesc.bNumConfigurations == 6) {
+		// USB Ethernet + CDC-NCM
+		return 4;
+	}
+
+	if(devdesc.bNumConfigurations != 5) {
+		// No known modes with more then 5 configurations
+		return 0;
+	}
+
+	if((res = libusb_get_config_descriptor_by_value(dev, 5, &config)) != 0) {
+		usbmuxd_log(LL_NOTICE, "Could not get configuration 5 descriptor for device %i-%i: %s", bus, address, libusb_error_name(res));
+		return 0;
+	}
+
+	// Require both usbmux and one of the other interfaces to determine this is a valid configuration
+	for(j = 0 ; j < config->bNumInterfaces ; j++) {
+		const struct libusb_interface_descriptor *intf = &config->interface[j].altsetting[0];
+		if(intf->bInterfaceClass == INTERFACE_CLASS &&
+		   intf->bInterfaceSubClass == 42 &&
+		   intf->bInterfaceProtocol == 255) {
+			has_valeria = 1;
 		}
-		/* verify if the configuration 5 is actually usable */
-		do {
-			struct libusb_config_descriptor *config;
-			const struct libusb_interface_descriptor *intf;
-			if (libusb_get_config_descriptor_by_value(dev, 5, &config) != 0) {
-				usbmuxd_log(LL_WARNING, "Device %d-%d: Failed to get config descriptor for configuration 5, choosing configuration 4 instead.", bus, address);
-				desired_config = 4;
-				break;
-			}
-			if (config->bNumInterfaces != 3) {
-				usbmuxd_log(LL_WARNING, "Device %d-%d: Ignoring possibly bad configuration 5, choosing configuration 4 instead.", bus, address);
-				desired_config = 4;
-				break;
-			}
-			intf = &config->interface[2].altsetting[0];
-			if (intf->bInterfaceClass != 0xFF || intf->bInterfaceSubClass != 0x2A || intf->bInterfaceProtocol != 0xFF) {
-				usbmuxd_log(LL_WARNING, "Device %d-%d: Ignoring possibly bad configuration 5, choosing configuration 4 instead.", bus, address);
-				desired_config = 4;
-				break;
-			}
-		} while (0);
+		// https://github.com/torvalds/linux/blob/72a85e2b0a1e1e6fb4ee51ae902730212b2de25c/include/uapi/linux/usb/cdc.h#L22
+		// 2 for Communication class, 0xd for CDC NCM subclass
+		if(intf->bInterfaceClass == 2 &&
+		   intf->bInterfaceSubClass == 0xd) {
+			has_cdc_ncm = 1;
+		}
+		if(intf->bInterfaceClass == INTERFACE_CLASS &&
+		   intf->bInterfaceSubClass == INTERFACE_SUBCLASS &&
+		   intf->bInterfaceProtocol == INTERFACE_PROTOCOL) {
+			has_usbmux = 1;
+		}
 	}
+
+	libusb_free_config_descriptor(config);
+
+	if(has_valeria && has_usbmux) {
+		usbmuxd_log(LL_NOTICE, "Found Valeria and Apple USB Multiplexor in device %i-%i configuration 5", bus, address);
+		return 2;
+	}
+
+	if(has_cdc_ncm && has_usbmux) {
+		usbmuxd_log(LL_NOTICE, "Found CDC-NCM and Apple USB Multiplexor in device %i-%i configuration 5", bus, address);
+		return 3;
+	}
+
+	return 0;
+}
+
+/// @brief Finds and sets the valid configuration, interface and endpoints on the usb_device
+static int set_valid_configuration(struct libusb_device* dev, struct usb_device *usbdev, struct libusb_device_handle *handle)
+{
+	int j, k, res, found = 0;
+	struct libusb_config_descriptor *config;
+	const struct libusb_interface_descriptor *intf;
+	struct libusb_device_descriptor devdesc = usbdev->devdesc;
+	int bus = usbdev->bus;
+	int address = usbdev->address;
 	int current_config = 0;
+
 	if((res = libusb_get_configuration(handle, &current_config)) != 0) {
-		usbmuxd_log(LL_WARNING, "Could not get configuration for device %d-%d: %s", bus, address, libusb_error_name(res));
-		libusb_close(handle);
+		usbmuxd_log(LL_WARNING, "Could not get current configuration for device %d-%d: %s", bus, address, libusb_error_name(res));
 		return -1;
 	}
-	if (current_config != desired_config) {
-		struct libusb_config_descriptor *config;
+
+	for(j = devdesc.bNumConfigurations ; j > 0  ; j--) {
+		if((res = libusb_get_config_descriptor_by_value(dev, j, &config)) != 0) {
+			usbmuxd_log(LL_NOTICE, "Could not get configuration %i descriptor for device %i-%i: %s", j, bus, address, libusb_error_name(res));
+			continue;
+		}
+		for(k = 0 ; k < config->bNumInterfaces ; k++) {
+			intf = &config->interface[k].altsetting[0];
+			if(intf->bInterfaceClass == INTERFACE_CLASS || 
+			   intf->bInterfaceSubClass == INTERFACE_SUBCLASS || 
+			   intf->bInterfaceProtocol == INTERFACE_PROTOCOL) {
+				usbmuxd_log(LL_NOTICE, "Found usbmux interface for device %i-%i: %i", bus, address, intf->bInterfaceNumber);
+				if(intf->bNumEndpoints != 2) {
+					usbmuxd_log(LL_WARNING, "Endpoint count mismatch for interface %i of device %i-%i", intf->bInterfaceNumber, bus, address);
+					continue;
+				}
+				if((intf->endpoint[0].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_OUT &&
+				   (intf->endpoint[1].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_IN) {
+					usbdev->interface = intf->bInterfaceNumber;
+					usbdev->ep_out = intf->endpoint[0].bEndpointAddress;
+					usbdev->ep_in = intf->endpoint[1].bEndpointAddress;
+					usbmuxd_log(LL_INFO, "Found interface %i with endpoints %02x/%02x for device %i-%i", usbdev->interface, usbdev->ep_out, usbdev->ep_in, bus, address);
+					found = 1;
+					break;
+				} else if((intf->endpoint[1].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_OUT &&
+						  (intf->endpoint[0].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_IN) {
+					usbdev->interface = intf->bInterfaceNumber;
+					usbdev->ep_out = intf->endpoint[1].bEndpointAddress;
+					usbdev->ep_in = intf->endpoint[0].bEndpointAddress;
+					usbmuxd_log(LL_INFO, "Found interface %i with swapped endpoints %02x/%02x for device %i-%i", usbdev->interface, usbdev->ep_out, usbdev->ep_in, bus, address);
+					found = 1;
+					break;
+				} else {
+					usbmuxd_log(LL_WARNING, "Endpoint type mismatch for interface %i of device %i-%i", intf->bInterfaceNumber, bus, address);
+				}
+			}
+		}
+		if(!found) {
+			libusb_free_config_descriptor(config);
+			continue;
+		}
+		// If set configuration is required, try to first detach all kernel drivers
 		if (current_config == 0) {
 			usbmuxd_log(LL_DEBUG, "Device %d-%d is unconfigured", bus, address);
-		} else if ((res = libusb_get_active_config_descriptor(dev, &config)) != 0) {
-			usbmuxd_log(LL_NOTICE, "Could not get old configuration descriptor for device %d-%d: %s", bus, address, libusb_error_name(res));
-		} else {
-			for(j=0; j<config->bNumInterfaces; j++) {
-				const struct libusb_interface_descriptor *intf = &config->interface[j].altsetting[0];
-				if((res = libusb_kernel_driver_active(handle, intf->bInterfaceNumber)) < 0) {
-					usbmuxd_log(LL_NOTICE, "Could not check kernel ownership of interface %d for device %d-%d: %s", intf->bInterfaceNumber, bus, address, libusb_error_name(res));
+		}
+		if(current_config == 0 || config->bConfigurationValue != current_config) {
+			usbmuxd_log(LL_NOTICE, "Changing configuration of device %i-%i: %i -> %i", bus, address, current_config, config->bConfigurationValue);
+			for(k=0 ; k < config->bNumInterfaces ; k++) {
+				const struct libusb_interface_descriptor *intf1 = &config->interface[k].altsetting[0];
+				if((res = libusb_kernel_driver_active(handle, intf1->bInterfaceNumber)) < 0) {
+					usbmuxd_log(LL_NOTICE, "Could not check kernel ownership of interface %d for device %d-%d: %s", intf1->bInterfaceNumber, bus, address, libusb_error_name(res));
 					continue;
 				}
 				if(res == 1) {
-					usbmuxd_log(LL_INFO, "Detaching kernel driver for device %d-%d, interface %d", bus, address, intf->bInterfaceNumber);
-					if((res = libusb_detach_kernel_driver(handle, intf->bInterfaceNumber)) < 0) {
+					usbmuxd_log(LL_INFO, "Detaching kernel driver for device %d-%d, interface %d", bus, address, intf1->bInterfaceNumber);
+					if((res = libusb_detach_kernel_driver(handle, intf1->bInterfaceNumber)) < 0) {
 						usbmuxd_log(LL_WARNING, "Could not detach kernel driver, configuration change will probably fail! %s", libusb_error_name(res));
 						continue;
 					}
 				}
 			}
-			libusb_free_config_descriptor(config);
+			if((res = libusb_set_configuration(handle, j)) != 0) {
+				usbmuxd_log(LL_WARNING, "Could not set configuration %d for device %d-%d: %s", j, bus, address, libusb_error_name(res));
+				libusb_free_config_descriptor(config);
+				continue;
+			}
 		}
-
-		usbmuxd_log(LL_INFO, "Setting configuration for device %d-%d, from %d to %d", bus, address, current_config, desired_config);
-		if((res = libusb_set_configuration(handle, desired_config)) != 0) {
-			usbmuxd_log(LL_WARNING, "Could not set configuration %d for device %d-%d: %s", desired_config, bus, address, libusb_error_name(res));
-			libusb_close(handle);
-			return -1;
-		}
-	}
-
-	struct libusb_config_descriptor *config;
-	if((res = libusb_get_active_config_descriptor(dev, &config)) != 0) {
-		usbmuxd_log(LL_WARNING, "Could not get configuration descriptor for device %d-%d: %s", bus, address, libusb_error_name(res));
-		libusb_close(handle);
-		return -1;
-	}
-
-	struct usb_device *usbdev;
-	usbdev = malloc(sizeof(struct usb_device));
-	memset(usbdev, 0, sizeof(*usbdev));
-
-	for(j=0; j<config->bNumInterfaces; j++) {
-		const struct libusb_interface_descriptor *intf = &config->interface[j].altsetting[0];
-		if(intf->bInterfaceClass != INTERFACE_CLASS ||
-		   intf->bInterfaceSubClass != INTERFACE_SUBCLASS ||
-		   intf->bInterfaceProtocol != INTERFACE_PROTOCOL)
-			continue;
-		if(intf->bNumEndpoints != 2) {
-			usbmuxd_log(LL_WARNING, "Endpoint count mismatch for interface %d of device %d-%d", intf->bInterfaceNumber, bus, address);
-			continue;
-		}
-		if((intf->endpoint[0].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_OUT &&
-		   (intf->endpoint[1].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_IN) {
-			usbdev->interface = intf->bInterfaceNumber;
-			usbdev->ep_out = intf->endpoint[0].bEndpointAddress;
-			usbdev->ep_in = intf->endpoint[1].bEndpointAddress;
-			usbmuxd_log(LL_INFO, "Found interface %d with endpoints %02x/%02x for device %d-%d", usbdev->interface, usbdev->ep_out, usbdev->ep_in, bus, address);
-			break;
-		} else if((intf->endpoint[1].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_OUT &&
-		          (intf->endpoint[0].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_IN) {
-			usbdev->interface = intf->bInterfaceNumber;
-			usbdev->ep_out = intf->endpoint[1].bEndpointAddress;
-			usbdev->ep_in = intf->endpoint[0].bEndpointAddress;
-			usbmuxd_log(LL_INFO, "Found interface %d with swapped endpoints %02x/%02x for device %d-%d", usbdev->interface, usbdev->ep_out, usbdev->ep_in, bus, address);
-			break;
-		} else {
-			usbmuxd_log(LL_WARNING, "Endpoint type mismatch for interface %d of device %d-%d", intf->bInterfaceNumber, bus, address);
-		}
-	}
-
-	if(j == config->bNumInterfaces) {
-		usbmuxd_log(LL_WARNING, "Could not find a suitable USB interface for device %d-%d", bus, address);
+		
 		libusb_free_config_descriptor(config);
-		libusb_close(handle);
-		free(usbdev);
+		break;
+	}
+
+	if(!found) {
+		usbmuxd_log(LL_WARNING, "Could not find a suitable USB interface for device %i-%i", bus, address);
 		return -1;
 	}
 
-	libusb_free_config_descriptor(config);
+	return 0;
+}
+
+static void device_complete_initialization(struct mode_context *context, struct libusb_device_handle *handle) 
+{
+	struct usb_device *usbdev = find_device(context->bus, context->address);
+	if(!usbdev) {
+		usbmuxd_log(LL_ERROR, "Device %d-%d is missing from device list, aborting initialization", context->bus, context->address);
+		return;
+	}
+	struct libusb_device *dev = context->dev;
+	struct libusb_device_descriptor devdesc = usbdev->devdesc;
+	int bus = context->bus;
+	int address = context->address;
+	int res;
+	struct libusb_transfer *transfer;
+
+	if((res = set_valid_configuration(dev, usbdev, handle)) != 0) {
+		usbdev->alive = 0;
+		return;
+	}
 
 	if((res = libusb_claim_interface(handle, usbdev->interface)) != 0) {
 		usbmuxd_log(LL_WARNING, "Could not claim interface %d for device %d-%d: %s", usbdev->interface, bus, address, libusb_error_name(res));
-		libusb_close(handle);
-		free(usbdev);
-		return -1;
+		usbdev->alive = 0;
+		return;
 	}
 
 	transfer = libusb_alloc_transfer(0);
 	if(!transfer) {
 		usbmuxd_log(LL_WARNING, "Failed to allocate transfer for device %d-%d: %s", bus, address, libusb_error_name(res));
-		libusb_close(handle);
-		free(usbdev);
-		return -1;
+		usbdev->alive = 0;
+		return;
 	}
 
 	unsigned char *transfer_buffer = malloc(1024 + LIBUSB_CONTROL_SETUP_SIZE + 8);
 	if (!transfer_buffer) {
 		usbmuxd_log(LL_WARNING, "Failed to allocate transfer buffer for device %d-%d: %s", bus, address, libusb_error_name(res));
-		libusb_close(handle);
-		free(usbdev);
-		return -1;
+		usbdev->alive = 0;
+		return;
 	}
 	memset(transfer_buffer, '\0', 1024 + LIBUSB_CONTROL_SETUP_SIZE + 8);
 
@@ -542,7 +605,7 @@ static int usb_device_add(libusb_device* dev)
 	usbdev->address = address;
 	usbdev->devdesc = devdesc;
 	usbdev->speed = 480000000;
-	usbdev->dev = handle;
+	usbdev->handle = handle;
 	usbdev->alive = 1;
 	usbdev->wMaxPacketSize = libusb_get_max_packet_size(dev, usbdev->ep_out);
 	if (usbdev->wMaxPacketSize <= 0) {
@@ -561,6 +624,9 @@ static int usb_device_add(libusb_device* dev)
 			break;
 		case LIBUSB_SPEED_SUPER:
 			usbdev->speed = 5000000000;
+			break;
+		case LIBUSB_SPEED_SUPER_PLUS:
+			usbdev->speed = 10000000000;
 			break;
 		case LIBUSB_SPEED_HIGH:
 		case LIBUSB_SPEED_UNKNOWN:
@@ -583,17 +649,164 @@ static int usb_device_add(libusb_device* dev)
 	if((res = libusb_submit_transfer(transfer)) < 0) {
 		usbmuxd_log(LL_ERROR, "Could not request transfer for device %d-%d: %s", usbdev->bus, usbdev->address, libusb_error_name(res));
 		libusb_free_transfer(transfer);
-		libusb_close(handle);
 		free(transfer_buffer);
-		free(usbdev);
+		usbdev->alive = 0;
+		return;	
+	}
+}
+
+static void switch_mode_cb(struct libusb_transfer* transfer) 
+{
+	// For old devices not supporting mode swtich, if anything goes wrong - continue in current mode
+	struct mode_context* context = transfer->user_data;
+	struct usb_device *dev = find_device(context->bus, context->address);
+	if(!dev) {
+		usbmuxd_log(LL_WARNING, "Device %d-%d is missing from device list", context->bus, context->address);
+	}
+	if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+		usbmuxd_log(LL_ERROR, "Failed to request mode switch for device %i-%i (%i). Completing initialization in current mode", 
+			context->bus, context->address, transfer->status);
+		device_complete_initialization(context, transfer->dev_handle);
+	}
+	else {
+		unsigned char *data = libusb_control_transfer_get_data(transfer);
+		if(data[0] != 0) {
+			usbmuxd_log(LL_INFO, "Received unexpected response for device %i-%i mode switch (%i). Completing initialization in current mode", 
+				context->bus, context->address, data[0]);
+			device_complete_initialization(context, transfer->dev_handle);
+		}
+	}
+	free(context);
+	if(transfer->buffer)
+		free(transfer->buffer);
+}
+
+static void get_mode_cb(struct libusb_transfer* transfer) 
+{
+	// For old devices not supporting mode swtich, if anything goes wrong - continue in current mode
+	int res;
+	struct mode_context* context = transfer->user_data;
+	struct usb_device *dev = find_device(context->bus, context->address);
+	if(!dev) {
+		usbmuxd_log(LL_ERROR, "Device %d-%d is missing from device list, aborting mode switch", context->bus, context->address);
+		free(context);
+		return;
+	}
+
+	if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+		usbmuxd_log(LL_ERROR, "Failed to request get mode for device %i-%i (%i). Completing initialization in current mode", 
+			context->bus, context->address, transfer->status);
+		device_complete_initialization(context, transfer->dev_handle);
+		free(context);
+		return;
+	}
+
+	unsigned char *data = libusb_control_transfer_get_data(transfer);
+
+	char* desired_mode_char = getenv(ENV_DEVICE_MODE);
+	int desired_mode = desired_mode_char ? atoi(desired_mode_char) : 1;
+	int guessed_mode = guess_mode(context->dev, dev);
+
+	// Response is 3:3:3:0 for initial mode, 5:3:3:0 otherwise.
+	usbmuxd_log(LL_INFO, "Received response %i:%i:%i:%i for get_mode request for device %i-%i", data[0], data[1], data[2], data[3], context->bus, context->address);
+	if(desired_mode >= 1 && desired_mode <= 5 &&
+	   guessed_mode > 0 && // do not switch mode if guess failed
+	   guessed_mode != desired_mode) {
+		usbmuxd_log(LL_WARNING, "Switching device %i-%i mode to %i", context->bus, context->address, desired_mode);
+		
+		context->bRequest = APPLE_VEND_SPECIFIC_SET_MODE;
+		context->wValue = 0;
+		context->wIndex = desired_mode;
+		context->wLength = 1;
+
+		if((res = submit_vendor_specific(transfer->dev_handle, context, switch_mode_cb)) != 0) {
+			usbmuxd_log(LL_WARNING, "Could not request to switch mode %i for device %i-%i (%i)", context->wIndex, context->bus, context->address, res);
+			dev->alive = 0;
+			free(context);
+		}
+	} 
+	else {
+		usbmuxd_log(LL_WARNING, "Skipping switch device %i-%i mode from %i to %i", context->bus, context->address, guessed_mode, desired_mode);
+		device_complete_initialization(context, transfer->dev_handle);
+		free(context);
+	}
+	if(transfer->buffer)
+		free(transfer->buffer);
+}
+
+static int usb_device_add(libusb_device* dev)
+{
+	int res;
+	// the following are non-blocking operations on the device list
+	uint8_t bus = libusb_get_bus_number(dev);
+	uint8_t address = libusb_get_device_address(dev);
+	struct libusb_device_descriptor devdesc;
+	struct usb_device *usbdev = find_device(bus, address);
+	if(usbdev) {
+		usbdev->alive = 1;
+		return 0; //device already found
+	}
+
+	if((res = libusb_get_device_descriptor(dev, &devdesc)) != 0) {
+		usbmuxd_log(LL_WARNING, "Could not get device descriptor for device %d-%d: %s", bus, address, libusb_error_name(res));
 		return -1;
 	}
+	if(devdesc.idVendor != VID_APPLE)
+		return -1;
+	if((devdesc.idProduct != PID_APPLE_T2_COPROCESSOR) &&
+	   ((devdesc.idProduct < PID_APPLE_SILICON_RESTORE_LOW) ||
+		(devdesc.idProduct > PID_APPLE_SILICON_RESTORE_MAX)) &&
+	   ((devdesc.idProduct < PID_RANGE_LOW) ||
+		(devdesc.idProduct > PID_RANGE_MAX)))
+		return -1;
+	libusb_device_handle *handle;
+	usbmuxd_log(LL_INFO, "Found new device with v/p %04x:%04x at %d-%d", devdesc.idVendor, devdesc.idProduct, bus, address);
+	// No blocking operation can follow: it may be run in the libusb hotplug callback and libusb will refuse any
+	// blocking call
+	if((res = libusb_open(dev, &handle)) != 0) {
+		usbmuxd_log(LL_WARNING, "Could not open device %d-%d: %s", bus, address, libusb_error_name(res));
+		return -1;
+	}
+
+	// Add the created handle to the device list, so we can close it in case of failure/disconnection
+	usbdev = malloc(sizeof(struct usb_device));
+	memset(usbdev, 0, sizeof(*usbdev));
+
+	usbdev->serial[0] = 0;
+	usbdev->bus = bus;
+	usbdev->address = address;
+	usbdev->devdesc = devdesc;
+	usbdev->speed = 0;
+	usbdev->handle = handle;
+	usbdev->alive = 1;
 
 	collection_init(&usbdev->tx_xfers);
 	collection_init(&usbdev->rx_xfers);
 
 	collection_add(&device_list, usbdev);
 
+	// On top of configurations, Apple have multiple "modes" for devices, namely:
+	// 1: An "initial" mode with 4 configurations
+	// 2: "Valeria" mode, where configuration 5 is included with interface for H.265 video capture (activated when recording screen with QuickTime in macOS)
+	// 3: "CDC NCM" mode, where configuration 5 is included with interface for Ethernet/USB (activated using internet-sharing feature in macOS)
+	// Request current mode asynchroniously, so it can be changed in callback if needed
+	usbmuxd_log(LL_INFO, "Requesting current mode from device %i-%i", bus, address);
+	struct mode_context* context = malloc(sizeof(struct mode_context));
+	context->dev = dev;
+	context->bus = bus;
+	context->address = address;
+	context->bRequest = APPLE_VEND_SPECIFIC_GET_MODE;
+	context->wValue = 0;
+	context->wIndex = 0;
+	context->wLength = 4;
+	context->timeout = 1000;
+
+	if(submit_vendor_specific(handle, context, get_mode_cb) != 0) {
+		usbmuxd_log(LL_WARNING, "Could not request current mode from device %d-%d", bus, address);
+		// Schedule device for close and cleanup
+		usbdev->alive = 0;
+		return -1;
+	}
 	return 0;
 }
 
@@ -654,7 +867,7 @@ int usb_discover(void)
 
 const char *usb_get_serial(struct usb_device *dev)
 {
-	if(!dev->dev) {
+	if(!dev->handle) {
 		return NULL;
 	}
 	return dev->serial;
@@ -662,7 +875,7 @@ const char *usb_get_serial(struct usb_device *dev)
 
 uint32_t usb_get_location(struct usb_device *dev)
 {
-	if(!dev->dev) {
+	if(!dev->handle) {
 		return 0;
 	}
 	return (dev->bus << 16) | dev->address;
@@ -670,7 +883,7 @@ uint32_t usb_get_location(struct usb_device *dev)
 
 uint16_t usb_get_pid(struct usb_device *dev)
 {
-	if(!dev->dev) {
+	if(!dev->handle) {
 		return 0;
 	}
 	return dev->devdesc.idProduct;
@@ -678,7 +891,7 @@ uint16_t usb_get_pid(struct usb_device *dev)
 
 uint64_t usb_get_speed(struct usb_device *dev)
 {
-	if (!dev->dev) {
+	if (!dev->handle) {
 		return 0;
 	}
 	return dev->speed;

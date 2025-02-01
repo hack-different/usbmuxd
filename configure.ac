@@ -1,13 +1,18 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
-AC_PREREQ(2.68)
-AC_INIT([usbmuxd], [1.1.2], [https://github.com/libimobiledevice/usbmuxd/issues],, [https://libimobiledevice.org])
+AC_PREREQ([2.68])
+AC_INIT([usbmuxd], [m4_esyscmd(./git-version-gen $RELEASE_VERSION)], [https://github.com/libimobiledevice/usbmuxd/issues], [], [https://libimobiledevice.org])
 AM_INIT_AUTOMAKE([dist-bzip2 no-dist-gzip check-news])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES])
 AC_CONFIG_SRCDIR([src/])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
+
+# Check if we have a version defined
+if test -z $PACKAGE_VERSION; then
+  AC_MSG_ERROR([PACKAGE_VERSION is not defined. Make sure to configure a source tree checked out from git or that .tarball-version is present.])
+fi
 
 # Checks for programs.
 AC_PROG_CC
@@ -16,14 +21,14 @@ LT_INIT
 
 # Checks for libraries.
 PKG_CHECK_MODULES(libusb, libusb-1.0 >= 1.0.9)
-PKG_CHECK_MODULES(libplist, libplist-2.0 >= 2.2.0)
+PKG_CHECK_MODULES(libplist, libplist-2.0 >= 2.6.0)
 PKG_CHECK_MODULES(libimobiledevice, libimobiledevice-1.0 >= 1.3.0, have_limd=yes, have_limd=no)
 PKG_CHECK_MODULES(limd_glue, libimobiledevice-glue-1.0 >= 1.0.0)
 
 AC_ARG_WITH([preflight],
             [AS_HELP_STRING([--without-preflight],
             [do not build with preflight worker support @<:@default=yes@:>@])],
-            [with_preflight=no],
+            [with_preflight=$withval],
             [with_preflight=yes])
 
 if test "x$have_limd" = "xyes"; then
@@ -35,7 +40,7 @@ if test "x$have_limd" = "xyes"; then
     AC_SUBST(libimobiledevice_CFLAGS)
     AC_SUBST(libimobiledevice_LIBS)
     CACHED_CFLAGS="$CFLAGS"
-    CFLAGS+=" $libimobiledevice_CFLAGS"
+    CFLAGS="$CFLAGS $libimobiledevice_CFLAGS"
     AC_CACHE_CHECK(for enum idevice_connection_type, ac_cv_enum_idevice_connection_type,
       AC_COMPILE_IFELSE([AC_LANG_PROGRAM([
         #include <libimobiledevice/libimobiledevice.h>
@@ -70,7 +75,7 @@ fi
 AC_ARG_WITH([systemd],
             [AS_HELP_STRING([--without-systemd],
             [do not build with systemd support @<:@default=yes@:>@])],
-            [],
+            [with_systemd=$withval],
             [with_systemd=yes])
 
 AC_ARG_WITH([systemdsystemunitdir],
@@ -148,10 +153,15 @@ AM_CONDITIONAL(WIN32, test x$win32 = xtrue)
 AC_SUBST([UDEV_SUB])
 AC_SUBST([SYSTEMD_SUB])
 
-AS_COMPILER_FLAGS(GLOBAL_CFLAGS, "-g -Wall -Wextra -Wmissing-declarations -Wredundant-decls -Wshadow -Wpointer-arith  -Wwrite-strings -Wswitch-default -Wno-unused-parameter")
+AS_COMPILER_FLAGS(GLOBAL_CFLAGS, "-Wall -Wextra -Wmissing-declarations -Wredundant-decls -Wshadow -Wpointer-arith  -Wwrite-strings -Wswitch-default -Wno-unused-parameter")
 AC_SUBST(GLOBAL_CFLAGS)
 
 m4_ifdef([AM_SILENT_RULES],[AM_SILENT_RULES([yes])])
+
+# workaround for older autoconf versions
+if test "x$runstatedir" == "x"; then
+  runstatedir=$localstatedir/run
+fi
 
 AC_CONFIG_FILES([
 Makefile
